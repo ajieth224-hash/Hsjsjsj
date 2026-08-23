@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: owo-farm-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: node dest/index.js import /etc/secrets/data.json
