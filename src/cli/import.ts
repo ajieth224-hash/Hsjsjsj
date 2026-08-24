@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 import { ConfigSchema, Configuration } from "@/schemas/ConfigSchema.js";
 import { BaseAgent } from "@/structure/BaseAgent.js";
 import { logger } from "@/utils/logger.js";
@@ -16,8 +17,51 @@ export const builder = {
     account: {
         type: "string",
         alias: "a",
-        description: "Which account key to use, if the file has more than one (e.g. b2ki-ados/data.json)",
+        description: "Which single account key to run. If omitted and the file has more than one account, ALL of them are launched as isolated child processes.",
     },
+};
+
+// Pipes a child process stream line-by-line into the parent's output, prefixed with
+// the account key, so a multi-account log stream stays readable (e.g. on Render).
+const pipeWithPrefix = (stream: NodeJS.ReadableStream, prefix: string, out: NodeJS.WritableStream) => {
+    let buffer = "";
+    stream.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) out.write(`[${prefix}] ${line}\n`);
+    });
+    stream.on("end", () => {
+        if (buffer) out.write(`[${prefix}] ${buffer}\n`);
+    });
+};
+
+// Launches one account in its own isolated Node process (re-invoking this same
+// entrypoint with --account <key>). Isolation matters because some critical-event
+// paths in the bot call process.exit() directly (e.g. on a ban, or running out of
+// money) - if every account shared one process, one account hitting that would kill
+// every other account too. A separate process per account contains the blast radius
+// to that one account, and PORT is stripped so only the parent binds Render's health-
+// check port.
+const spawnAccount = (scriptPath: string, filename: string, key: string) => {
+    const useTsx = scriptPath.endsWith(".ts");
+    const command = useTsx ? "npx" : process.execPath;
+    const args = useTsx
+        ? ["tsx", scriptPath, "import", filename, "--account", key]
+        : [scriptPath, "import", filename, "--account", key];
+
+    const childEnv = { ...process.env };
+    delete childEnv.PORT;
+
+    const child = spawn(command, args, { env: childEnv, cwd: process.cwd() });
+    pipeWithPrefix(child.stdout!, key, process.stdout);
+    pipeWithPrefix(child.stderr!, key, process.stderr);
+
+    child.on("exit", (code, signal) => {
+        logger.warn(`[${key}] process exited (code=${code}, signal=${signal}). It will stay stopped until this service restarts.`);
+    });
+
+    return child;
 };
 
 export const handler = async (argv: { filename: string; account?: string }) => {
@@ -41,7 +85,7 @@ export const handler = async (argv: { filename: string; account?: string }) => {
         // The file can either be a flat config object (a standalone export), or the
         // app's own multi-account b2ki-ados/data.json format (an object keyed by
         // account, each value a full config). Try flat first, then fall back to the
-        // keyed format. Neither path ever prompts, so this stays safe to run
+        // keyed format. No path here ever prompts, so this stays safe to run
         // non-interactively (e.g. on a host like Render with no terminal to answer one).
         const flatResult = ConfigSchema.safeParse(parsed);
         if (flatResult.success) {
@@ -64,7 +108,18 @@ export const handler = async (argv: { filename: string; account?: string }) => {
                 config = validEntries[0].data;
                 logger.info(`Using account "${validEntries[0].key}" from ${filePath}`);
             } else if (validEntries.length > 1) {
-                throw new Error(`File ${filePath} has ${validEntries.length} accounts (${validEntries.map(e => e.key).join(", ")}). Re-run with --account <key> to pick one.`);
+                // Multiple accounts and no --account given: launch every account as its
+                // own child process instead of picking one. This process becomes a
+                // supervisor - it does not log in anywhere itself.
+                logger.info(`Found ${validEntries.length} accounts in ${filePath}: ${validEntries.map(e => e.key).join(", ")}`);
+                logger.info("Starting one isolated process per account...");
+
+                for (const entry of validEntries) {
+                    spawnAccount(process.argv[1], argv.filename, entry.key);
+                }
+
+                logger.info(`All ${validEntries.length} account processes started. This supervisor process will keep running to host them.`);
+                return;
             } else {
                 throw new Error(`Invalid configuration: ${flatResult.error.message}`);
             }
